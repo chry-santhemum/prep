@@ -10,7 +10,8 @@ wheels/
 # Virtual environments
 .venv
 
-# Stuff
+# Possibly large or useless files
+*.pkl
+*.txt
 data/
 tests/
-debug.txt

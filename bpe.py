@@ -1,6 +1,8 @@
 
 from dataclasses import dataclass
+from operator import le
 import os
+import copy
 import heapq
 import regex as re
 from tqdm.auto import tqdm
@@ -126,10 +128,6 @@ class MaxHeapObj():
     def __lt__(self, other): return self.val > other.val
     def __eq__(self, other): return self.val == other.val
     def __str__(self): return str(self.val)
-
-
-def to_heap_node(k: tuple[bytes, bytes], v: int) -> tuple[int, tuple[bytes, bytes]]:
-    return MaxHeapObj((v, k))
         
 
 def train_bpe(
@@ -148,6 +146,10 @@ def train_bpe(
     heap = []  # duplicate storage for fast get max
     merges: list[tuple[bytes, bytes]] = []
 
+    def heap_push_new(k: tuple[bytes, bytes]):
+        if cached_counts.get(k, 0):
+            heapq.heappush(heap, MaxHeapObj((cached_counts[k], k)))
+
     print("Initializing cached counts...")
 
     for k, v in pretok_dict.items():
@@ -155,7 +157,7 @@ def train_bpe(
             cached_counts[(k[i], k[i+1])] += v
     
     for k, v in cached_counts.items():
-        heapq.heappush(heap, to_heap_node(k, v))
+        heapq.heappush(heap, MaxHeapObj((v, k)))
 
     while num_vocab < vocab_size - len(special_tokens):
         assert num_vocab == len(vocab)
@@ -164,36 +166,30 @@ def train_bpe(
         if all(len(k) == 1 for k in pretok_dict.keys()):
             break
 
-        # Update vocab:
-        # Find the pair with greatest count
-        # Tiebreak lexicographically
+        # Get new merge
         max_key = None
         while heap:
             heap_obj = heapq.heappop(heap)
             val, key = heap_obj.val
-            if cached_counts[key] == val:
+
+            # only use if 1) value is not stale, and 2) not already merged
+            if cached_counts[key] == val and key not in merges:
                 max_key = key
                 break
         if max_key is None:
             break
 
         new_word = max_key[0] + max_key[1]
-        # Try to decode, fallback to hex representation if not valid UTF-8
-        # try:
-        #     display = new_word.decode('utf-8')
-        # except UnicodeDecodeError:
-        #     display = new_word
-        # print(f"Inserted new key: {display}")
         vocab[num_vocab] = new_word
         num_vocab += 1
-
-        # Update merges
         merges.append(max_key)
 
-        # Update pretok_dict
+        # Update pretok_dict and cached_counts
         replacements: dict[tuple[bytes], tuple[bytes]] = {}
-        for k in pretok_dict.keys():
-            if new_word in b"".join(k):
+        for k, v in pretok_dict.items():
+            if max_key in [(k[i], k[i+1]) for i in range(len(k) - 1)]:
+
+                # replace key name
                 k_hat_list = []
                 i = 0
                 while i < len(k):
@@ -209,43 +205,32 @@ def train_bpe(
 
                 replacements[k] = tuple(k_hat_list)
 
-        print(f"Replacements: {replacements}")
+                # update cached_counts
+                for i in range(len(k) - 1):
+                    cached_counts[(k[i], k[i+1])] -= v
+                for i in range(len(k_hat_list) - 1):
+                    cached_counts[(k_hat_list[i], k_hat_list[i+1])] += v
+
 
         for k, k_hat in replacements.items():
             val = pretok_dict[k]
             pretok_dict.pop(k)
-            pretok_dict[k_hat] = val
+            pretok_dict[k_hat] = pretok_dict.get(k_hat, 0) + val
 
-        # Update cached counts and heap
         cached_counts.pop(max_key)
-        
-        for k, v in pretok_dict.items():
-            if new_word not in k:
-                continue
-            for i in range(len(k) - 1):
-                if k[i] == new_word or k[i+1] == new_word:
-                    cached_counts[(k[i], k[i+1])] += v
 
+        # update heap
         for word in vocab.values():
+            heap_push_new((word, max_key[0]))
+            heap_push_new((max_key[1], word))
             if word == new_word:
-                heapq.heappush(heap, to_heap_node((word, word), cached_counts[(word, word)]))
-                continue
+                heap_push_new((word, word))
+            else:
+                heap_push_new((word, new_word))
+                heap_push_new((new_word, word))
 
-            if cached_counts[(word, new_word)]:
-                cached_counts[(word, max_key[0])] -= cached_counts[(word, new_word)]
-                assert cached_counts[(word, max_key[0])] >= 0
-                heapq.heappush(heap, to_heap_node((word, max_key[0]), cached_counts[(word, max_key[0])]))
-            heapq.heappush(heap, to_heap_node((word, new_word), cached_counts[(word, new_word)]))
-
-            if cached_counts[(max_key[1], word)]:
-                cached_counts[(max_key[1], word)] -= cached_counts[(new_word, word)]
-                assert cached_counts[(max_key[1], word)] >= 0
-                heapq.heappush(heap, to_heap_node((max_key[1], word), cached_counts[(max_key[1], word)]))
-            heapq.heappush(heap, to_heap_node((new_word, word), cached_counts[(new_word, word)]))
-
-        # print(f"Cached count now has {len(cached_counts)} items")
-        # print(f"Current cached_counts: {cached_counts}")
-        # print(f"Heap now has {len(heap)} items")
+        print(f"Cached count now has {len(cached_counts)} items")
+        print(f"Heap now has {len(heap)} items")
 
     # Fill in the special tokens
     for tok in special_tokens:
@@ -255,10 +240,57 @@ def train_bpe(
     return vocab, merges
 
 
+class Tokenizer:
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str]):
+        self.vocab = copy.deepcopy(vocab)
+        for new_special_tok in special_tokens:
+            self.vocab[len(vocab)] = new_special_tok
+
+        self.merges = merges
+        self.new_special_tokens = special_tokens
+        self.all_special_tokens = [v for k, v in self.vocab if k >= len(self.merges)]
+
+        print(f"Tokenizer has {len(self.all_special_tokens)} special tokens in total, {len(self.new_special_tokens)} new special tokens")
+
+
+    def encode_pretoken(self, pretoken: list[bytes]) -> list[int]:
+        """
+        Encode a split pre-token containing a list of single bytes.
+        """
+        
+
+
+
+
+    def encode(self, input: str) -> list[int]:
+        escaped_special_tokens = [re.escape(tok) for tok in self.all_special_tokens]
+        to_match = b"(" + b"|".join(escaped_special_tokens) + b")"
+
+        split_file = re.split(pattern=to_match, string=input.encode("utf-8"))
+
+        pretokenized_list: list[list[bytes]] = []
+        for split_chunk in split_file:
+            # pre-tokenize
+            for match in re.finditer(RE_PATTERN, split_chunk):
+                key = match.group()
+                pretokenized_list.append([bytes([b]) for b in key])
+
+        
+        
+
+
+
+
+
 if __name__ == "__main__":
+    import pickle
+
     vocab, merges = train_bpe(
         input_path="data/TinyStoriesV2-GPT4-valid.txt",
         vocab_size=8192,
         special_tokens=["<|endoftext|>"],
     )
+
+    with open("bpe_tokenizer_tsval.pkl", "wb") as f:
+        pickle.dump((vocab, merges), f)
 
