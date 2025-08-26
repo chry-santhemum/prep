@@ -1,15 +1,13 @@
 
-from dataclasses import dataclass
-from operator import le
 import os
 import copy
 import heapq
 import regex as re
+from sympy import false
 from tqdm.auto import tqdm
-from typing import BinaryIO
+from typing import BinaryIO, Iterable, Iterator
 from collections import defaultdict
-
-from functools import partial
+from dataclasses import dataclass
 from multiprocessing import Pool
 
 
@@ -241,25 +239,33 @@ def train_bpe(
 
 
 class Tokenizer:
-    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str]):
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str]|None):
         self.vocab = copy.deepcopy(vocab)
-        for new_special_tok in special_tokens:
-            self.vocab[len(vocab)] = new_special_tok
+        if special_tokens:
+            for new_special_tok in special_tokens:
+                self.vocab[len(vocab)] = new_special_tok
+
+        self.inverse_vocab = {
+            v: k for k, v in self.vocab.items()
+        }
 
         self.merges = merges
         self.new_special_tokens = special_tokens
-        self.all_special_tokens = [v for k, v in self.vocab if k >= len(self.merges)]
+        self.all_special_tokens = [v for k, v in self.vocab.items() if k >= len(self.merges)]
 
-        print(f"Tokenizer has {len(self.all_special_tokens)} special tokens in total, {len(self.new_special_tokens)} new special tokens")
-
-
-    def encode_pretoken(self, pretoken: list[bytes]) -> list[int]:
+    def find_first_merge(self, partial_tokens: list[bytes]) -> bool:
         """
-        Encode a split pre-token containing a list of single bytes.
+        Find the first mergeable pair in partial_tokens and merge them in-place.
+        Returns True if a pair is merged.
         """
-        
+        for merge in self.merges:
+            for i in range(len(partial_tokens) - 1):
+                if merge == (partial_tokens[i], partial_tokens[i+1]):
+                    partial_tokens.pop(i+1)
+                    partial_tokens[i] = merge[0] + merge[1]
+                    return True
 
-
+        return False
 
 
     def encode(self, input: str) -> list[int]:
@@ -275,10 +281,34 @@ class Tokenizer:
                 key = match.group()
                 pretokenized_list.append([bytes([b]) for b in key])
 
-        
-        
+        for partial_tokens in pretokenized_list:
+            not_done = True
+            while not_done:
+                not_done = self.find_first_merge(partial_tokens)
 
+        ids: list[int] = []
+        for pretok in pretokenized_list:
+            ids += [self.inverse_vocab[tok] for tok in pretok]
 
+        return ids
+
+    
+    def encode_iterable(self, streaming_input: Iterable[str]) -> Iterator[int]:
+        iterator = iter(streaming_input)
+
+        while True:
+            try:
+                next_str = next(iterator)
+                tokens = self.encode(next_str)
+                for tok in tokens:
+                    yield tok
+
+            except StopIteration:
+                break
+
+    def decode(self, ids: list[int]) -> str:
+        tokens = [self.vocab[id] for id in ids]
+        return "".join(tokens)
 
 
 
