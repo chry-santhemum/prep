@@ -243,15 +243,17 @@ class Tokenizer:
         self.vocab = copy.deepcopy(vocab)
         if special_tokens:
             for new_special_tok in special_tokens:
-                self.vocab[len(vocab)] = new_special_tok
+                if new_special_tok.encode("utf-8") not in self.vocab.values():
+                    self.vocab[len(vocab)] = new_special_tok.encode("utf-8")
 
-        self.inverse_vocab = {
+        self.inverse_vocab: dict[bytes, int] = {
             v: k for k, v in self.vocab.items()
         }
 
         self.merges = merges
         self.new_special_tokens = special_tokens
-        self.all_special_tokens = [v for k, v in self.vocab.items() if k >= len(self.merges)]
+        self.all_special_tokens = [v for k, v in self.vocab.items() if k >= len(self.merges) + 256]
+        print(self.all_special_tokens)
 
     def find_first_merge(self, partial_tokens: list[bytes]) -> bool:
         """
@@ -269,14 +271,22 @@ class Tokenizer:
 
 
     def encode(self, input: str) -> list[int]:
-        escaped_special_tokens = [re.escape(tok) for tok in self.all_special_tokens]
+        escaped_special_tokens = sorted(
+            [re.escape(tok) for tok in self.all_special_tokens],
+            key=lambda x: len(x),
+            reverse=True,
+        )
         to_match = b"(" + b"|".join(escaped_special_tokens) + b")"
 
         split_file = re.split(pattern=to_match, string=input.encode("utf-8"))
+        print("Split file: ", split_file)
 
         pretokenized_list: list[list[bytes]] = []
         for split_chunk in split_file:
             # pre-tokenize
+            if split_chunk in self.all_special_tokens:
+                pretokenized_list.append([split_chunk])
+                continue
             for match in re.finditer(RE_PATTERN, split_chunk):
                 key = match.group()
                 pretokenized_list.append([bytes([b]) for b in key])
@@ -286,9 +296,13 @@ class Tokenizer:
             while not_done:
                 not_done = self.find_first_merge(partial_tokens)
 
+        print("Encoded tokens:", pretokenized_list)
+
         ids: list[int] = []
         for pretok in pretokenized_list:
-            ids += [self.inverse_vocab[tok] for tok in pretok]
+            ids.extend([self.inverse_vocab[tok] for tok in pretok])
+
+        print(ids)
 
         return ids
 
@@ -307,8 +321,10 @@ class Tokenizer:
                 break
 
     def decode(self, ids: list[int]) -> str:
-        tokens = [self.vocab[id] for id in ids]
-        return "".join(tokens)
+        tokens = [self.vocab.get(id, "\uFFFD".encode("utf-8")) for id in ids]
+        concat_tokens = b"".join(tokens)
+        print(concat_tokens)
+        return concat_tokens.decode("utf-8", errors="replace")
 
 
 
