@@ -3,7 +3,6 @@ import os
 import copy
 import heapq
 import regex as re
-from sympy import false
 from tqdm.auto import tqdm
 from typing import BinaryIO, Iterable, Iterator
 from collections import defaultdict
