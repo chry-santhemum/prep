@@ -63,17 +63,17 @@ class RMSNorm(Module):
         super().__init__()
         self.d_model=d_model
         self.eps=eps
-        self.gains = Parameter(
+        self.weight = Parameter(
             data=torch.ones(d_model, device=device, dtype=dtype)
         )
-        self.device=self.gains.data.device
-        self.dtype=self.gains.data.dtype
+        self.device=self.weight.data.device
+        self.dtype=self.weight.data.dtype
 
     def forward(self, x: Float[Tensor, "... d_model"]):
         # upcast for numerical stability
         original_dtype = x.dtype
         x = x.float()
-        x_gain = einsum("... d_model, d_model -> ... d_model", x, self.gains.float())
+        x_gain = einsum("... d_model, d_model -> ... d_model", x, self.weight.float())
 
         squared_x = einsum("... d_model, ... d_model -> ...", x, x)
         rms_norm = torch.sqrt(squared_x / self.d_model) + self.eps
@@ -103,14 +103,14 @@ class GatedLinearUnit(Module):
         self.d_model = d_model
         self.d_mlp = d_mlp
 
-        self.W_up = Linear(d_in=d_model, d_out=d_mlp, device=device, dtype=dtype)
-        self.W_gate = Linear(d_in=d_model, d_out=d_mlp, device=device, dtype=dtype)
-        self.W_down = Linear(d_in=d_mlp, d_out=d_model, device=device, dtype=dtype)
+        self.up_proj = Linear(d_in=d_model, d_out=d_mlp, device=device, dtype=dtype)
+        self.gate_proj = Linear(d_in=d_model, d_out=d_mlp, device=device, dtype=dtype)
+        self.down_proj = Linear(d_in=d_mlp, d_out=d_model, device=device, dtype=dtype)
         self.act = activation_function
 
     def forward(self, x: Float[Tensor, "... d_model"]):
-        y = self.W_down(
-            self.W_up(x) * self.act(self.W_gate(x))
+        y = self.down_proj(
+            self.up_proj(x) * self.act(self.gate_proj(x))
         )
         return y
     
@@ -162,10 +162,12 @@ class RotaryPositionalEmbedding(Module):
 
 
 def softmax(x: Float[Tensor, "..."], dim: int=-1):
+    x_dtype = x.dtype
+    x = x.float()
     x_max = torch.max(x, dim=dim, keepdim=True).values
     x_exp = torch.exp(x - x_max)
     x_exp_sum = torch.sum(x_exp, dim=dim, keepdim=True)
-    return x_exp / x_exp_sum
+    return (x_exp / x_exp_sum).to(x_dtype)
 
 
 def scaled_dot_product_attention(
@@ -186,4 +188,49 @@ def scaled_dot_product_attention(
     return attn_output
 
 
+
+# TODO:
+# GQA / MLA
+class MultiHeadSelfAttention(Module):
+    def __init__(self, n_head, d_model, pos_emb: RotaryPositionalEmbedding|None=None, device=None, dtype=None):
+        super().__init__()
+
+        self.n_head = n_head
+        self.d_model = d_model
+        self.d_qk = d_model // n_head
+        self.d_v = d_model // n_head
+
+        self.pos_emb = pos_emb
+
+        # all heads are concatenated
+        self.q_proj = Linear(self.d_model, self.d_qk * self.n_head, device=device, dtype=dtype)
+        self.k_proj = Linear(self.d_model, self.d_qk * self.n_head, device=device, dtype=dtype)
+        self.v_proj = Linear(self.d_model, self.d_v * self.n_head, device=device, dtype=dtype)
+        self.output_proj = Linear(self.d_v * self.n_head, self.d_model, device=device, dtype=dtype)
+
+        self.device = self.q_proj.device
+        self.dtype = self.q_proj.dtype
+
+    def forward(self, x: Float[Tensor, "batch_size ... seq_len d_model"], token_positions: Tensor|None=None):
+        queries = einops.rearrange(self.q_proj(x), "batch_size ... (n_head d_qk) -> batch_size n_head ... d_qk", n_head=self.n_head)
+        keys = einops.rearrange(self.k_proj(x), "batch_size ... (n_head d_qk) -> batch_size n_head ... d_qk", n_head=self.n_head)
+        values = einops.rearrange(self.v_proj(x), "batch_size ... (n_head d_v) -> batch_size n_head ... d_v", n_head=self.n_head)
+
+        seq_len = queries.shape[-2]
+        if self.pos_emb is not None:
+            if token_positions is None:
+                token_positions = torch.arange(seq_len, device=self.device).expand_as(queries[..., 0])
+            queries = self.pos_emb(queries, token_positions)
+            keys = self.pos_emb(keys, token_positions)
+        
+        attention_mask = torch.arange(seq_len)[:, None] >= torch.arange(seq_len)[None, :]
+        attention_mask = attention_mask.to(self.device)
+
+        attention_out = einops.rearrange(
+            scaled_dot_product_attention(queries, keys, values, attention_mask),
+            "batch_size n_head ... seq_len d_v -> batch_size ... seq_len (n_head d_v)",
+            n_head=self.n_head
+        )
+
+        return self.output_proj(attention_out)
 
