@@ -1,11 +1,12 @@
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Iterable
 from jaxtyping import Float, Int
 
 import numpy as np
 import torch
 from torch import Tensor
 from torch.optim import Optimizer
+from torch.nn import Parameter
 
 def cross_entropy(logits: Float[Tensor, "... vocab_size"], labels: Int[Tensor, "..."]) -> float:
     logits_minus_max = logits - logits.max(dim=-1, keepdim=True).values
@@ -91,3 +92,28 @@ class AdamW(Optimizer):
                 state["t"] = t+1
 
         return loss
+
+
+def cosine_anneal_scheduler(t: int, lr_max: float, lr_min: float, T_warmup: int, T_anneal: int):
+    if t < T_warmup:
+        return lr_max * t / T_warmup
+    if t > T_anneal:
+        return lr_min
+
+    ratio = (t - T_warmup) / (T_anneal - T_warmup)
+    return lr_min + (lr_max - lr_min) * 0.5 * (1 + np.cos(np.pi * ratio))
+
+
+def gradient_clipping(params: Iterable[Parameter], max_l2_norm: float, eps: float=1e-6):
+    all_norms = []
+    for p in params:
+        if p.requires_grad:
+            all_norms.append(p.grad.norm())
+
+    if torch.tensor(all_norms).norm() > max_l2_norm:
+        scale = max_l2_norm / torch.tensor(all_norms).norm()
+
+        for p in params:
+            if p.requires_grad:
+                p.grad.copy_(p.grad * scale)
+
